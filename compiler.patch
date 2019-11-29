@@ -1,0 +1,1938 @@
+diff --git a/Makefile b/Makefile
+index 723287e..9ca909c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,4 +4,6 @@ BASEDIR := $(PWD)
+ .phony: %
+ 
+ %:
+-	cd $(MKDIR) && ocaml compiler.ml $(BASEDIR)/$@.scm > $@.s && nasm -f elf64 -o $@.o $@.s && gcc -static -m64 -o $@ $@.o && mv $@ $(BASEDIR)
++	cd $(MKDIR) && ocaml compiler.ml $(BASEDIR)/$@.scm > $@.s && nasm -f elf64 -o $@.o $@.s && gcc -g -static -m64 -o $@ $@.o && mv $@ $(BASEDIR)
++
++
+diff --git a/code-gen.ml b/code-gen.ml
+index 0d1442c..47884da 100644
+--- a/code-gen.ml
++++ b/code-gen.ml
+@@ -1,14 +1,455 @@
+ #use "semantic-analyser.ml";;
+ 
+ module type CODE_GEN = sig
+-  val make_consts_tbl : expr' list -> (constant * ('a * string)) list
+-  val make_fvars_tbl : expr' list -> (string * 'a) list
+-  val generate : (constant * ('a * string)) list -> (string * 'a) list -> expr' -> string
++  val make_consts_tbl : expr' list -> (constant * (int * string)) list
++  val make_fvars_tbl : expr' list -> (string * int) list
++  val generate : (constant * (int * string)) list -> (string * int) list -> expr' -> string
++  val findConst : constant -> (constant * ('a * 'b)) list -> 'a
++  val findFVar : string -> (string * int) list -> int
+ end;;
+ 
+ module Code_Gen : CODE_GEN = struct
+-  let make_consts_tbl asts = raise X_not_yet_implemented;;
+-  let make_fvars_tbl asts = raise X_not_yet_implemented;;
+-  let generate consts fvars e = raise X_not_yet_implemented;;
++  let rec str_to_ascii str =
++    match (String.length str) with
++    | 1 -> (string_of_int (int_of_char (String.get str 0)))
++    | 0 -> ""
++    | _ -> (string_of_int (int_of_char (String.get str 0)))^", "^(str_to_ascii (String.sub str 1 ((String.length str)-1)));;
++
++let gensym =
++         let cnt = ref 0 in
++         fun var ->
++           let x = incr cnt; !cnt in
++           var ^ "_" ^ string_of_int x;;
++
++let string_to_asts s = List.map Semantics.run_semantics
++                         (Tag_Parser.tag_parse_expressions
++                            (Reader.read_sexprs s));;
++
++let rec findAddress sexp allSet =
++	match allSet with
++	|[] -> -1
++	|(Sexpr(h), (address, _)) :: t -> (if (sexpr_eq h sexp) then address else findAddress sexp t)
++	|_ -> raise X_not_yet_implemented;;
++
++let rec make_vector_lit_string lst allSet =
++	match lst with
++	|[] -> ""
++	|h :: [] -> (let index = findAddress h allSet in
++				(if (index < 0) then raise X_not_yet_implemented else "const_tbl + " ^ string_of_int index))
++	|h :: t -> (let index = findAddress h allSet in
++				(if (index < 0) then raise X_not_yet_implemented else "const_tbl + " ^ (string_of_int index) ^ ", " ^ make_vector_lit_string t allSet));;
++
++let make_set lst =
++	let rec isin exp lst =
++	match lst with
++	|[] -> false
++	|h :: t -> sexpr_eq h exp || isin exp t in
++
++	let rec next lst cur = 
++		match lst with
++		|[] -> cur
++		|h :: t -> (if (isin h cur) then next t cur else next t (List.concat[cur; [h]])) in
++	next lst [];;
++
++  let make_consts_tbl asts = 
++
++  	let rec constsTbl ast= 
++		match ast with
++		|Const'(consta) -> (match consta with 
++							|Sexpr(consta) -> [consta]
++							|_ -> [])
++		|BoxSet'(_, expr) -> constsTbl expr
++		|If'(test, dit, dif) -> List.concat[constsTbl test; constsTbl dit; constsTbl dif]
++		|Seq'(lst) -> List.concat(List.map (fun (x) -> constsTbl x) lst)
++		|Set'(e1, e2) -> List.concat[constsTbl e1; constsTbl e2]
++		|Def'(e1, e2) -> List.concat[constsTbl e1; constsTbl e2]
++		|Or'(lst) -> List.concat(List.map (fun (x) -> constsTbl x) lst)
++		|LambdaSimple'(_, exp) -> constsTbl exp
++		|LambdaOpt'(_, _, exp) -> constsTbl exp
++		|Applic'(exp, lst) -> List.concat[constsTbl exp; List.concat(List.map (fun (x) -> constsTbl x) lst)]
++		|ApplicTP'(exp, lst) -> List.concat[constsTbl exp; List.concat(List.map (fun (x) -> constsTbl x) lst)]
++		|_ -> [] in
++
++		let rec lstConstsTbl astlst =
++			(match astlst with
++			|[] -> []
++			|h :: t -> List.concat[constsTbl h; lstConstsTbl t]) in
++
++			let rec subconsts sexp =
++				(match sexp with
++				|Pair(e1, e2) -> List.concat[(subconsts e1); (subconsts e2); [sexp]]
++				|Symbol(sym) -> List.concat[subconsts (String(sym)); [sexp]]
++				|Vector(lst) -> List.concat[(List.concat (List.map (fun (x) -> subconsts x) lst)) ; [sexp]]
++				|_ -> [sexp]) in
++
++				let rec make_tuples set address allSet =
++					match set with
++					|[] -> allSet
++					|h :: t -> (match h with
++								|Bool(b) -> make_tuples t (address + 2) (List.concat[allSet; [(Sexpr(h), (address, (if (b) then "MAKE_BOOL_TRUE" else "MAKE_BOOL_FALSE")))]])
++								|Nil -> make_tuples t (address + 1) (List.concat[allSet; [(Sexpr(h), (address, "db T_NIL"))]])
++								|Number(Int(n)) -> make_tuples t (address + 9) (List.concat[allSet; [(Sexpr(h), (address, "MAKE_LITERAL_INT(" ^ (string_of_int n) ^ ")"))]])
++								|Number(Float(n)) -> make_tuples t (address + 9) (List.concat[allSet; [(Sexpr(h), (address, "MAKE_LITERAL_FLOAT(" ^ (string_of_float n) ^ ")"))]])
++								|Char(c) -> make_tuples t (address + 2) (List.concat[allSet; [(Sexpr(h), (address, "MAKE_LITERAL_CHAR " ^ str_to_ascii(String.make 1 c)))]])
++								|String(str) -> (let len = String.length str in
++												make_tuples t (address + 1 + 8 + len) (List.concat[allSet; [(Sexpr(h), (address, "MAKE_LITERAL_STRING " ^ str_to_ascii str))]]))
++								|Symbol(str) -> (let index = (findAddress (String(str)) allSet) in
++												make_tuples t (address + 9) (List.concat [allSet; [(Sexpr(h), (address, "MAKE_LITERAL_SYMBOL(const_tbl + " ^ (if (index < 0) then raise X_not_yet_implemented else string_of_int index ^ ")")))]]))
++								|Pair(s1, s2) -> (let index1 = findAddress s1 allSet in
++													let index2 = findAddress s2 allSet in
++													(if (index1 < 0 || index2 < 0) then raise X_not_yet_implemented else
++														make_tuples t (address + 17) (List.concat [allSet; 
++														[(Sexpr(h), (address, "MAKE_LITERAL_PAIR(const_tbl + " ^ (string_of_int index1) ^ ", const_tbl + " ^ (string_of_int index2) ^ ")"))]])))
++								|Vector(lst) -> (let size = List.length lst in
++												make_tuples t (address + 1 + 8 + (size*8))
++												 (List.concat [allSet; [(Sexpr(h), (address, "MAKE_LITERAL_VECTOR " ^ (make_vector_lit_string lst allSet)))]]))) in
++				((Void, (0, "db T_VOID")) :: 
++					(make_tuples 
++						(make_set 
++							(List.concat(List.map 
++								subconsts 
++								(make_set 
++									(List.concat
++										[[Nil; Bool(true); Bool(false)] ;
++										 (lstConstsTbl asts)]
++										)
++								)
++							))
++						)
++						1
++						[]));;
++
++	
++  let make_fvars_tbl asts = 
++  	let rec fvarsTbl ast = 
++  		(match ast with
++  		| Var'(VarFree(str)) -> [str]
++  		| Box'(VarFree(str)) -> [str]
++ 		| BoxSet'(VarFree(str), exp) -> List.concat[[str] ; fvarsTbl exp]
++ 		| BoxGet'(VarFree(str)) -> [str]
++ 		| If'(exp1, exp2, exp3) -> List.concat[fvarsTbl exp1 ; fvarsTbl exp2 ; fvarsTbl exp3]
++ 		| Seq'(lst) -> List.concat(List.map fvarsTbl lst)
++ 		| Set'(exp1, exp2) -> List.concat[fvarsTbl exp1 ; fvarsTbl exp2]
++ 		| Def'(exp1, exp2) -> List.concat[fvarsTbl exp1 ; fvarsTbl exp2]
++ 		| Or'(lst) -> List.concat(List.map fvarsTbl lst)
++ 		| LambdaSimple'(_, exp) -> fvarsTbl exp
++ 		| LambdaOpt'(_,_,exp) -> fvarsTbl exp
++ 		| Applic'(exp, lst) -> List.concat[fvarsTbl exp ; List.concat(List.map fvarsTbl lst)]
++ 		| ApplicTP'(exp, lst) -> List.concat[fvarsTbl exp ; List.concat(List.map fvarsTbl lst)]
++ 		|_ -> []) in 
++
++	let make_set lst =
++		(let rec isin exp lst =
++		(match lst with
++		|[] -> false
++		|h :: t -> String.equal h exp || isin exp t) in
++			let rec next lst cur = 
++				(match lst with
++				|[] -> cur
++				|h :: t -> (if (isin h cur) then next t cur else next t (List.concat[cur; [h]]))) in
++		next lst []) in
++
++		let rec makePairs lst index =
++			(match lst with
++			| (e :: es) -> ((e ,index) :: (makePairs es (index+1)))
++			| [] -> []) in
++
++      let start_fvars = ["boolean?"; "float?"; "integer?"; "pair?";
++   "null?"; "char?"; "vector?"; "string?"; "procedure?"; "symbol?"; "string-length"; "string-ref"; "string-set!"; "make-string";
++   "vector-length"; "vector-ref"; "vector-set!"; "make-vector"; "symbol->string"; "char->integer"; "integer->char"; "eq?";
++   "+"; "*"; "-"; "/"; "<"; "="; "car"; "cdr"; "set-car!"; "set-cdr!"; "cons"; "apply"] in
++
++			makePairs (make_set (List.concat [start_fvars; (List.concat(List.map fvarsTbl asts))])) 0 ;;
++
++let rec findConst exp consts =
++  		(match consts with
++  		| ((Void, (e1, _)) :: tail) -> (match exp with 
++  										|Void -> e1
++  										|Sexpr(sexp)->findConst exp tail)
++  		| ((Sexpr(e), (e1, _)) :: tail) -> (match exp with 
++  										|Void -> findConst exp tail
++  										|Sexpr(sexp) -> if(sexpr_eq e sexp) then e1 else (findConst exp tail))
++  		| _ -> raise X_not_yet_implemented);;
++
++let rec findFVar exp fvars =
++	(match fvars with
++		| [] -> raise X_not_yet_implemented
++		| (str, i) :: t -> (if (String.equal str exp) then i else findFVar exp t));;
++
++  let rec gen consts fvars e =
++  	(match e with 
++  		| Const'(es) -> let add = findConst es consts in "mov rax, const_tbl+"^(string_of_int add)^"
++  		"
++  		| Var'(VarParam(_, minor)) -> "mov rax, qword [rbp + 8 * (4 + " ^ (string_of_int minor) ^ ")]
++  		"
++  		| Set'(Var'(VarParam(_, minor)), exp) -> (gen consts fvars exp) ^ "mov qword [rbp + 8* (4 + " ^ (string_of_int minor) ^ ")], rax
++  		mov rax, SOB_VOID_ADDRESS
++  		"
++  		| Var'(VarBound(_, mjor, mnor)) -> let getnil = gensym "get_nil" in 
++		let cont = gensym "cont" in
++		"mov rax, qword [rbp + 8 * 2] 		;; env
++  		VECTOR_ELEMENTS rdx, rax
++  		mov rax, qword [rdx + 8 * " ^ (string_of_int mjor) ^ "]			;;env[mjor]
++  		VECTOR_ELEMENTS rdx, rax
++		VECTOR_LENGTH rcx, rax
++		cmp rcx, " ^ (string_of_int mnor) ^ "
++		je " ^ getnil ^ "
++  		mov rax, qword [rdx + 8 * " ^ (string_of_int mnor) ^ "]			;;env[mjor][mnor]
++		jmp " ^ cont ^ "
++		" ^ getnil ^ ":
++  		mov rax, SOB_NIL_ADDRESS
++		" ^ cont ^ ":
++		"
++  		|Set'(Var'(VarBound(_, mjor, mnor)), exp) -> (gen consts fvars exp) ^ "mov rbx, qword [rbp + 8 * 2]
++  		VECTOR_ELEMENTS rdx, rbx
++  		mov rbx, qword [rdx + 8 * " ^ (string_of_int mjor) ^ "]
++  		VECTOR_ELEMENTS rdx, rbx
++  		mov qword [rdx + 8 * " ^ (string_of_int mnor) ^ "], rax
++  		mov rax, SOB_VOID_ADDRESS
++  		"
++  		|Var'(VarFree(str)) -> "mov rax, qword[FVAR(" ^ (string_of_int (findFVar str fvars)) ^")]
++  		"
++  		|Set'(Var'(VarFree(str)), exp) -> (gen consts fvars exp) ^ "mov qword [FVAR(" ^ (string_of_int (findFVar str fvars)) ^ ")], rax
++  		mov rax, SOB_VOID_ADDRESS
++  		"
++  		|Seq'(lst) -> genSeq lst consts fvars
++  		|Or'(lst) -> genOr lst consts fvars
++  		|If'(test, dit, dif) -> genIf test dit dif consts fvars
++  		|Box'(v) -> let stub = (gen consts fvars (Var'(v))) in "mov rax, WORD_SIZE
++  		MALLOC rax, rax
++  		mov rbx, rax
++  		" ^ stub ^ "
++  		mov qword[rbx], rax
++  		mov rax, rbx
++  		"
++  		|BoxGet'(v) -> let stub = (gen consts fvars (Var'(v))) in stub ^ "mov rax, qword [rax]
++  		"
++  		|BoxSet'(v, exp) -> let stub = (gen consts fvars exp) in
++  							(stub ^ "push rax
++  							" ^ (gen consts fvars (Var'(v))) ^ "pop qword [rax]
++  							mov rax, SOB_VOID_ADDRESS
++  							")
++  		|LambdaSimple'(params, body) -> genLamSim params body consts fvars 
++  		|LambdaOpt'(params, opt, body) -> genLamOpt params opt body consts fvars
++  		|Applic'(exp, lst) -> genApp exp lst consts fvars 
++  		|ApplicTP'(exp, lst) -> genAppTp exp lst consts fvars 
++  		|Def'(Var'(VarFree(str)), exp) -> (gen consts fvars exp) ^ "mov qword [FVAR(" ^ (string_of_int (findFVar str fvars)) ^ ")], rax
++  		mov rax, SOB_VOID_ADDRESS
++  		"
++   		| _ -> gensym "taut")
++
++  	and genSeq lst consts fvars = (**)
++  		match lst with
++  		|[] -> ""
++  		|h :: [] -> gen consts fvars h
++  		|h :: t -> let stub = gen consts fvars h in stub ^ (genSeq t consts fvars )
++
++  	and genOr lst consts fvars =
++  		let _Lexit = gensym "Lexit" in
++  		thematchmatch lst _Lexit consts fvars
++
++  	and thematchmatch lst _Lexit consts fvars=	
++  		match lst with
++  		|h :: [] -> (gen consts fvars h) ^ _Lexit ^ ":
++  		"
++  		|h :: t -> let stub = gen consts fvars h in stub ^ "cmp rax, SOB_FALSE_ADDRESS
++  		jne " ^ _Lexit ^ "
++  		" ^ (thematchmatch t _Lexit consts fvars )
++  		|[] -> "mov rax, SOB_FALSE_ADDRESS"
++
++  	and genIf test dit dif consts fvars =
++  		let testa = gen consts fvars test in
++  		let dita = gen consts fvars dit in
++  		let difa = gen consts fvars dif in
++  		let _Lelse = gensym "Lelse" in
++  		let _Lexit = gensym "Lexit" in
++  		testa ^ "cmp rax, SOB_FALSE_ADDRESS
++  		je " ^ _Lelse ^ "
++  		" ^ dita ^ "jmp " ^ _Lexit ^ "
++  		" ^ _Lelse ^ ":
++  		" ^ difa ^ _Lexit ^ ":
++  		"
++
++  	and genLamSim params body consts fvars =
++  		let looplamsim1 = gensym ".loop_lamsim1" in
++  		let looplamsim2 = gensym ".loop_lamsim2" in
++  		let looplamsim1end = gensym "loop_lamsim1end" in
++  		let looplamsim2end = gensym "loop_lamsim2end" in
++  		let _Lcode = gensym "Lcode" in
++  		let _Lcont = gensym "Lcont" in
++  		"mov rbx, qword [rbp + 8 * 2]
++  		VECTOR_LENGTH rcx, rbx
++  		inc rcx
++  		MAKE_VECTOR rax, rcx, SOB_VOID_ADDRESS
++  		VECTOR_ELEMENTS rdx, rax
++  		VECTOR_ELEMENTS r8, rbx
++  		" ^ looplamsim1 ^ ":
++  		dec rcx
++  		cmp rcx, 0
++  		jz " ^ looplamsim1end ^ "
++  		dec rcx					;;old last
++  		mov r9, qword [r8 + 8 * rcx]
++  		inc rcx 					;;new last
++  		mov qword [rdx + 8 * rcx], r9
++  		jmp " ^ looplamsim1 ^ "
++  		" ^ looplamsim1end ^ ":
++  		mov rcx, qword [rbp + 8* 3]
++  		MAKE_VECTOR r10, rcx, SOB_VOID_ADDRESS
++  		VECTOR_ELEMENTS r11, r10
++  		" ^ looplamsim2 ^ ":
++  		cmp rcx, 0
++  		jz " ^ looplamsim2end ^ "
++  		dec rcx
++  		mov r12, PVAR(rcx)
++  		mov qword[r11 + rcx * 8], r12
++  		jmp " ^ looplamsim2 ^ " 
++  		" ^ looplamsim2end ^ ":
++  		mov qword [rdx], r10
++  		mov rbx, rax
++  		MAKE_CLOSURE(rax, rbx, " ^ _Lcode ^ ")
++  		jmp " ^ _Lcont ^ "
++  		" ^ _Lcode ^ ":
++  		push rbp
++  		mov rbp, rsp
++  		" ^ (gen consts fvars body) ^ "leave
++  		ret
++  		" ^_Lcont ^ ":
++  		"
++
++  	and genLamOpt params opt exp consts fvars =
++  		let paramsCount = string_of_int (List.length params) in
++  		let lop = gensym "loop" in
++  		let ending = gensym "end" in
++  		let looplamsim1 = gensym ".loop_lamsim1" in
++  		let looplamsim2 = gensym ".loop_lamsim2" in
++  		let looplamsim1end = gensym "loop_lamsim1end" in
++  		let looplamsim2end = gensym "loop_lamsim2end" in
++  		let _Lcode = gensym "Lcode" in
++  		let _Lcont = gensym "Lcont" in
++  		"mov r14, qword [rbp + 8 * 3]
++  		mov rbx, qword [rbp + 8 * 2]
++  		VECTOR_LENGTH rcx, rbx
++  		inc rcx
++  		MAKE_VECTOR rax, rcx, SOB_VOID_ADDRESS
++  		VECTOR_ELEMENTS rdx, rax
++  		VECTOR_ELEMENTS r8, rbx
++  		" ^ looplamsim1 ^ ":
++  		dec rcx
++  		cmp rcx, 0
++  		jz " ^ looplamsim1end ^ "
++  		dec rcx 					;;old last
++  		mov r9, qword [r8 + 8 * rcx]
++  		inc rcx 					;;new last
++  		mov qword [rdx + 8 * rcx], r9
++  		jmp " ^ looplamsim1 ^ "
++  		" ^ looplamsim1end ^ ":
++  		mov rcx, qword [rbp + 8* 3]
++  		MAKE_VECTOR r10, rcx, SOB_VOID_ADDRESS
++  		VECTOR_ELEMENTS r11, r10
++  		" ^ looplamsim2 ^ ":
++  		cmp rcx, 0
++  		jz " ^ looplamsim2end ^ "
++  		dec rcx
++  		mov r12, PVAR(rcx)
++  		mov qword[r11 + rcx * 8], r12
++  		jmp " ^ looplamsim2 ^ " 
++  		" ^ looplamsim2end ^ ":
++  		mov qword [rdx], r10
++  		mov rbx, rax
++  		MAKE_CLOSURE(rax, rbx, " ^ _Lcode ^ ")
++  		jmp " ^ _Lcont ^ "
++  		" ^ _Lcode ^ ":
++  		push rbp
++  		mov rbp, rsp
++  		mov rdx, qword [rbp + 3 * 8]
++  		mov r14, rdx
++  		lea rbx, [rsp + (4 + r14) * 8]
++  		sub r14, " ^ paramsCount ^ "
++  		mov r10, rbx
++  		" ^ lop ^ ":
++  		cmp r14, 0
++  		je " ^ ending ^ "
++  		sub r10, 8
++  		mov r11, qword [r10]
++  		mov r12, qword[rbx]
++  		MAKE_PAIR(rax, r11, r12)
++  		mov qword [rbx], rax
++  		dec r14
++  		jmp " ^ lop ^ "
++  		" ^ ending ^ ":
++  		mov r14, qword [rbx]
++  		mov qword [rbp + (4 + " ^ paramsCount ^ ") * 8], r14
++		
++  		" ^ (gen consts fvars exp) ^ "leave
++  		ret
++  		" ^_Lcont ^ ":
++  		"
++
++  	and genApp exp lst consts fvars =
++  		let argus = genAppPars consts fvars lst in
++  		argus ^ "push " ^ (string_of_int (List.length lst)) ^ "
++  		" ^ (gen consts fvars exp) ^ "mov bl, byte [rax]
++  		cmp bl, T_CLOSURE
++  		jne _error ;; laasot mashu
++  		CLOSURE_ENV rcx, rax
++  		CLOSURE_CODE rdx, rax
++  		push rcx
++  		call rdx
++  		add rsp, 8*1
++  		pop rbx
++  		inc rbx
++  		shl rbx, 3
++  		add rsp, rbx
++  		"
++  	
++
++	and genAppPars consts fvars lst =
++		match lst with
++		|[] -> "push SOB_NIL_ADDRESS
++		"
++		|h :: t -> (genAppPars consts fvars t) ^ (gen consts fvars h) ^ "push rax
++		"
++
++	and genAppTp exp lst consts fvars =
++		let argus = genAppPars consts fvars lst in
++		let _loop = gensym "loop" in
++		let end_loop = gensym "end_loop" in
++		argus ^ "push " ^ (string_of_int (List.length lst)) ^ "
++  		" ^ (gen consts fvars exp) ^ "mov bl, byte [rax]
++  		cmp bl, T_CLOSURE
++  		jne _error ;; laasot mashu
++  		CLOSURE_ENV rcx, rax
++  		CLOSURE_CODE rdx, rax
++  		push rcx
++  		push qword [rbp + 8 * 1]
++  		push qword [rbp]
++  		mov rax, qword [rbp + 8 * 3]
++  		add rax, 5
++  		mov r11, 1
++  		mov rcx, " ^ string_of_int (List.length lst) ^ "
++  		add rcx, 5 
++  		" ^ _loop ^ ":
++  		cmp rcx, 0
++  		jz " ^ end_loop ^ "
++  		dec rcx
++  		dec rax
++  		mov r12, r11
++  		shl r12, 3
++  		mov r13, rbp
++  		sub r13, r12
++  		mov rbx, qword [r13]
++  		mov qword [rbp + WORD_SIZE * rax], rbx
++  		inc r11
++  		jmp " ^ _loop ^ "
++  		" ^ end_loop ^ ":
++  		imul rax, 8
++  		adc rbp, rax
++  		mov rsp, rbp
++      mov rbp, qword[rbp]
++  		pop r12
++  		jmp rdx
++  		";;
++
++  	let generate consts fvars e = gen consts fvars e;;
+ end;;
+ 
+diff --git a/compiler.ml b/compiler.ml
+index e724266..532c035 100644
+--- a/compiler.ml
++++ b/compiler.ml
+@@ -6,6 +6,11 @@ let file_to_string f =
+   close_in ic;
+   s;;
+ 
++let gensym =
++         let cnt = ref 0 in
++         fun var ->
++           let x = incr cnt; !cnt in
++           var ^ "_" ^ string_of_int x;;
+ let string_to_asts s = List.map Semantics.run_semantics
+                          (Tag_Parser.tag_parse_expressions
+                             (Reader.read_sexprs s));;
+@@ -18,15 +23,17 @@ let primitive_names_to_labels =
+    "vector-length", "vector_length"; "vector-ref", "vector_ref"; "vector-set!", "vector_set";
+    "make-vector", "make_vector"; "symbol->string", "symbol_to_string"; 
+    "char->integer", "char_to_integer"; "integer->char", "integer_to_char"; "eq?", "is_eq";
+-   "+", "bin_add"; "*", "bin_mul"; "-", "bin_sub"; "/", "bin_div"; "<", "bin_lt"; "=", "bin_equ"
+-(* you can add yours here *)];;
++   "+", "bin_add"; "*", "bin_mul"; "-", "bin_sub"; "/", "bin_div"; "<", "bin_lt"; "=", "bin_equ";
++  "car","car";"cdr","cdr"; "set-car!" , "set_car"; "set-cdr!" , "set_cdr"; "cons", "cons"; "apply", "apply"];;
+ 
+ let make_prologue consts_tbl fvars_tbl =
+-  let get_const_address const = raise X_not_yet_implemented in
+-  let get_fvar_address const = raise X_not_yet_implemented in
++  let get_const_address const = "const_tbl + " ^ string_of_int(Code_Gen.findConst const consts_tbl) in
++  let get_fvar_address const = "fvar_tbl + " ^ string_of_int((Code_Gen.findFVar const fvars_tbl)* 8) in
+   let make_primitive_closure (prim, label) =
+-"    MAKE_CLOSURE(rax, SOB_NIL_ADDRESS, " ^ label  ^ ")
+-    mov [" ^ (get_fvar_address prim)  ^ "], rax" in
++"mov rcx, 0
++MAKE_VECTOR rbx, rcx, SOB_VOID_ADDRESS
++    MAKE_CLOSURE(rax, rbx, " ^ label  ^ ")
++    mov qword[" ^ (get_fvar_address prim)  ^ "], rax" in
+   let make_constant (c, (a, s)) = s in
+   
+ "
+@@ -46,8 +53,8 @@ const_tbl:
+ ;;; definitions in the epilogue to work properly
+ %define SOB_VOID_ADDRESS " ^ get_const_address Void ^ "
+ %define SOB_NIL_ADDRESS " ^ get_const_address (Sexpr Nil) ^ "
+-%define SOB_FALSE_ADDRESS " ^ get_const_address (Sexpr (Bool true)) ^ "
+-%define SOB_TRUE_ADDRESS " ^ get_const_address (Sexpr (Bool false)) ^ "
++%define SOB_FALSE_ADDRESS " ^ get_const_address (Sexpr (Bool false)) ^ "
++%define SOB_TRUE_ADDRESS " ^ get_const_address (Sexpr (Bool true)) ^ "
+ 
+ fvar_tbl:
+ " ^ (String.concat "\n" (List.map (fun _ -> "dq T_UNDEFINED") fvars_tbl)) ^ "
+@@ -55,6 +62,9 @@ fvar_tbl:
+ global main
+ section .text
+ main:
++    ;; set up the heap
++    push rbp 
++  mov rbp, rsp
+     ;; set up the heap
+     mov rdi, GB(4)
+     call malloc
+@@ -66,14 +76,15 @@ main:
+     ;; from the top level (which SHOULD NOT HAPPEN
+     ;; AND IS A BUG) will cause a segfault.
+     push 0
+-    push qword SOB_NIL_ADDRESS
++    mov rbx, 0
++    MAKE_VECTOR rax, rbx, SOB_VOID_ADDRESS
++    push rax
+     push qword T_UNDEFINED
+-    push rsp
+-
+-    call code_fragment
+-    add rsp, 4*8
+-    ret
++    push rbp
++    mov rbp, rsp
+ 
++    jmp code_fragment
++    
+ code_fragment:
+     ;; Set up the primitive stdlib fvars:
+     ;; Since the primtive procedures are defined in assembly,
+@@ -81,28 +92,32 @@ code_fragment:
+     ;; This is where we emulate the missing (define ...) expressions
+     ;; for all the primitive procedures.
+ " ^ (String.concat "\n" (List.map make_primitive_closure primitive_names_to_labels)) ^ "
+- 
+ ";;
+ 
+-let epilogue = raise X_not_yet_implemented;;
++let epilogue = "
++epilogue:
++add rsp, 4*8
++    pop rbp
++    ret
++    _error:
++    call 0";;
+ 
+ exception X_missing_input_file;;
+ 
+ try
+   let infile = Sys.argv.(1) in
+-  let code =  (file_to_string "stdlib.scm") ^ (file_to_string infile) in
++  let code =  (file_to_string "stdlib.scm") ^ "\n" ^ (file_to_string infile)  in
+   let asts = string_to_asts code in
+   let consts_tbl = Code_Gen.make_consts_tbl asts in
+   let fvars_tbl = Code_Gen.make_fvars_tbl asts in
+   let generate = Code_Gen.generate consts_tbl fvars_tbl in
+-  let code_fragment = String.concat "\n\n"
+-                        (List.map
+-                           (fun ast -> (generate ast) ^ "\n    call write_sob_if_not_void")
++  let code_fragment = String.concat "\n\n" (List.map
++                           (fun ast -> let stub = (generate ast) in (if (String.equal stub "") then stub else  stub ^ "\n    call write_sob_if_not_void\n"))
+                            asts) in
+-  let provided_primitives = file_to_string "prims.s" in
++  let provided_primitives = "jmp epilogue\n" ^ file_to_string "prims.s" in
+                    
+   print_string ((make_prologue consts_tbl fvars_tbl)  ^
+-                  code_fragment ^
+-                    provided_primitives ^ "\n" ^ epilogue)
++                  code_fragment ^ "\n" ^
++                    provided_primitives ^  "\n" ^ epilogue)
+ 
+ with Invalid_argument(x) -> raise X_missing_input_file;;
+diff --git a/compiler.s b/compiler.s
+index 5c418e8..d5f4f6b 100644
+--- a/compiler.s
++++ b/compiler.s
+@@ -1,4 +1,4 @@
+-%define T_UNDEFINED 0
++%define T_UNDEFINED 0xbeef
+ %define T_VOID 1
+ %define T_NIL 2
+ %define T_INTEGER 3
+@@ -27,11 +27,22 @@
+ %define MB(n) 1024*KB(n)
+ %define GB(n) 1024*MB(n)
+ 
++%define FVAR(i) fvar_tbl+i*WORD_SIZE
+ 
+ %macro SKIP_TYPE_TAG 2
+ 	mov %1, qword [%2+TYPE_SIZE]	
+ %endmacro	
+ 
++
++%macro MAKE_BOOL_TRUE 0
++	db T_BOOL
++	db 1
++%endmacro 
++%macro MAKE_BOOL_FALSE 0
++	db T_BOOL
++	db 0
++%endmacro
++
+ %define INT_VAL SKIP_TYPE_TAG
+ 
+ %macro CHAR_VAL 2
+@@ -63,12 +74,14 @@
+ %define CLOSURE_CODE CDR
+ 
+ %define PVAR(n) qword [rbp+(4+n)*WORD_SIZE]
++
++%define PARAM_COUNT qword [rbp + 3 * 8]
+ 	
+ %define SOB_UNDEFINED T_UNDEFINED
+ %define SOB_NIL T_NIL
+ %define SOB_VOID T_VOID
+-%define SOB_FALSE word T_BOOL
+-%define SOB_TRUE word (1 << TYPE_SIZE | T_BOOL)
++%define SOB_FALSE T_BOOL
++%define SOB_TRUE 1 << TYPE_SIZE | T_BOOL
+ 
+ ; returns %2 allocated bytes in register %1
+ ; Supports using with %1 = %2
+@@ -135,8 +148,8 @@
+ 	push rcx
+ 	add %1, WORD_SIZE+TYPE_SIZE
+ 	mov rcx, %2
+-	cmp rcx, 0
+ %%vec_loop:
++	cmp rcx, 0
+ 	jz %%vec_loop_end
+ 	dec rcx
+ 	mov qword [%1+rcx*WORD_SIZE], %3
+@@ -146,14 +159,28 @@
+ 	pop rcx
+ %endmacro
+ 
++%macro MAKE_LITERAL_VECTOR 0-*
++	db T_VECTOR 
++	dq %0 
++	%rep %0
++		dq %1
++		%rotate 1
++	%endrep
++%endmacro
++
++%macro MAKE_LITERAL_CHAR 1
++	db T_CHAR
++	db %1
++%endmacro
++
+ ;;; Creates a SOB with tag %2 
+ ;;; from two pointers %3 and %4
+ ;;; Stores result in register %1
+ %macro MAKE_TWO_WORDS 4 
+-        MALLOC %1, TYPE_SIZE+WORD_BYTES*2
++        MALLOC %1, TYPE_SIZE+WORD_SIZE*2
+         mov byte [%1], %2
+         mov qword [%1+TYPE_SIZE], %3
+-        mov qword [%1+TYPE_SIZE+WORD_BYTES], %4
++        mov qword [%1+TYPE_SIZE+WORD_SIZE], %4
+ %endmacro
+ 
+ %macro MAKE_WORDS_LIT 3
+@@ -162,6 +189,33 @@
+         dq %3
+ %endmacro
+ 
++%macro MAKE_LITERAL_NUMBER 2
++	db %1
++	dq %2
++%endmacro
++
++%macro MAKE_LITERAL_STRING 0-*
++	db T_STRING
++	dq %0
++%rep %0
++	db %1
++	%rotate 1
++%endrep
++%endmacro
++
++;%macro MAKE_LITERAL_STRING 1+
++;	db T_STRING
++;	dq (%%end_str - %%str)
++;%%str:
++;	db %1
++;%%end_str:
++;%endmacro		
++		
++%macro MAKE_LITERAL_SYMBOL 1
++	db T_SYMBOL
++	dq %1
++%endmacro
++
+ %define MAKE_PAIR(r, car, cdr) \
+         MAKE_TWO_WORDS r, T_PAIR, car, cdr
+ 
+@@ -171,7 +225,26 @@
+ %define MAKE_CLOSURE(r, env, body) \
+         MAKE_TWO_WORDS r, T_CLOSURE, env, body
+ 
+-	
++%define MAKE_LITERAL_INT(r) MAKE_LITERAL_NUMBER T_INTEGER, r
++
++%define MAKE_LITERAL_FLOAT(r) MAKE_LITERAL_NUMBER T_FLOAT, r
++
++%macro SHIFT_FRAME 1
++	push rax
++	push rbx
++	mov rax, qword[rbp + 8*3]
++	add rax, 4
++	%assign i 1
++	%rep %1
++		dec rax
++		mov rbx, qword[rbp - 8 * i]
++		mov qword[rbp + 8 * rax], rbx
++		%assign i i+1
++	%endrep
++	pop rbx
++	pop rax
++%endmacro
++
+ extern exit, printf, malloc
+ global write_sob, write_sob_if_not_void
+ 
+diff --git a/prims.s b/prims.s
+index bd9d118..3ca40d4 100644
+--- a/prims.s
++++ b/prims.s
+@@ -7,7 +7,7 @@ is_boolean:
+ 
+     cmp sil, T_BOOL
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -25,7 +25,7 @@ is_float:
+ 
+     cmp sil, T_FLOAT
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -43,7 +43,7 @@ is_integer:
+ 
+     cmp sil, T_INTEGER
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -61,7 +61,7 @@ is_pair:
+ 
+     cmp sil, T_PAIR
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -79,7 +79,7 @@ is_null:
+ 
+     cmp sil, T_NIL
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -97,7 +97,7 @@ is_char:
+ 
+     cmp sil, T_CHAR
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -115,7 +115,7 @@ is_vector:
+ 
+     cmp sil, T_VECTOR
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -133,7 +133,7 @@ is_string:
+ 
+     cmp sil, T_STRING
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -151,7 +151,7 @@ is_procedure:
+ 
+     cmp sil, T_CLOSURE
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -169,7 +169,7 @@ is_symbol:
+ 
+     cmp sil, T_SYMBOL
+     jne .wrong_type
+-    mov rax, sob_true
++    mov rax, SOB_TRUE_ADDRESS
+     jmp .return
+ 
+ .wrong_type:
+@@ -894,3 +894,139 @@ bin_equ:
+     leave
+     ret
+ 
++car:
++    push rbp
++    mov rbp, rsp
++
++    mov rsi, PVAR(0)
++    CAR rax, rsi
++
++.return:
++    leave
++    ret
++   
++
++cdr:
++    push rbp
++    mov rbp, rsp
++
++    mov rsi, PVAR(0)
++    CDR rax, rsi
++   
++.return:
++    leave
++    ret
++
++set_car:
++    push rbp
++    mov rbp, rsp
++
++    mov rcx, PVAR(0) 
++    mov rdx, PVAR(1)
++
++    mov qword [rcx+1], rdx
++    mov rax, SOB_VOID_ADDRESS
++
++    leave
++    ret
++
++set_cdr:
++    push rbp
++    mov rbp, rsp
++
++    mov rcx, PVAR(0) 
++    mov rdx, PVAR(1)
++     
++    mov [rcx+9], rdx
++    mov rax, SOB_VOID_ADDRESS
++
++    leave
++    ret
++
++cons:
++        push rbp
++        mov rbp, rsp
++
++        mov rcx, PVAR(0) 
++        mov rdx, PVAR(1)
++        
++        MAKE_PAIR(rax, rcx, rdx)
++
++
++        leave
++        ret 
++
++
++
++apply:
++        push rbp
++        mov rbp, rsp
++        push SOB_NIL_ADDRESS
++        xor rcx, rcx
++        mov rdx , qword [rbp+8*3]
++        dec rdx
++        mov rsi, PVAR(rdx)
++.params:
++    mov dl, byte [rsi]
++    cmp dl, T_NIL
++    je .Border
++    cmp dl, T_PAIR
++    je .pushArg
++    jmp .wrong_type
++.pushArg:
++    CAR r9, rsi
++    CDR rsi, rsi
++    push r9
++    inc rcx
++    jmp .params
++.Border:
++    xor r9 , r9
++    mov r12 , rcx 
++    dec r12
++.order:
++    cmp r9, r12
++    jge .BpushRest 
++    mov r14, [rsp + 8 * r9]
++    mov r15, [rsp + 8 * r12]
++    mov [rsp + 8 * r9], r15
++    mov [rsp + 8 * r12], r14
++    inc r9
++    dec r12
++    jmp .order
++.BpushRest:
++    mov rdx , qword [rbp+8*3]
++    sub rdx, 2
++.pushRest:
++    cmp rdx, 0 
++    jle .end_loop
++    mov rsi, PVAR(rdx)
++    push rsi
++    dec rdx
++    jmp .pushRest
++.end_loop:
++    mov rdx , qword [rbp+8*3]
++    sub rdx, 2
++    add rdx, rcx
++    push rdx 
++    mov rsi ,PVAR(0)
++    cmp byte [rsi], T_CLOSURE
++    jne .wrong_type
++    CLOSURE_ENV rdi,rsi
++    push rdi 
++.end:  
++  call qword [rsi+9]
++  add rsp , 8*1 
++  pop rbx 
++  inc rbx 
++  shl rbx , 3 
++  add rsp , rbx 
++  jmp .return 
++
++.wrong_type:
++    mov     rax, 60               
++    xor     rdi,rdi           
++    syscall 
++.return:
++    leave
++    ret   
++
+diff --git a/reader.ml b/reader.ml
+index 0955b39..48672d2 100644
+--- a/reader.ml
++++ b/reader.ml
+@@ -6,6 +6,7 @@
+  *)
+ 
+ #use "pc.ml";;
++open PC;;
+ 
+ exception X_not_yet_implemented;;
+ exception X_this_should_not_happen;;
+@@ -28,8 +29,7 @@ let rec sexpr_eq s1 s2 =
+   match s1, s2 with
+   | Bool(b1), Bool(b2) -> b1 = b2
+   | Nil, Nil -> true
+-  | Number(Float f1), Number(Float f2) -> abs_float(f1 -. f2) < 0.001
+-  | Number(Int n1), Number(Int n2) -> n1 = n2
++  | Number(n1), Number(n2) -> n1 = n2
+   | Char(c1), Char(c2) -> c1 = c2
+   | String(s1), String(s2) -> s1 = s2
+   | Symbol(s1), Symbol(s2) -> s1 = s2
+@@ -42,15 +42,249 @@ module Reader: sig
+   val read_sexprs : string -> sexpr list
+ end
+ = struct
++
++
++let string_to_list s =
++  let rec exp i l =
++    (if( i< 0 ) then l else exp (i-1) (s.[i] :: l)) in
++      exp ((String.length s)-1) [];;
++
+ let normalize_scheme_symbol str =
+   let s = string_to_list str in
+   if (andmap
+-	(fun ch -> (ch = (lowercase_ascii ch)))
+-	s) then str
++  (fun ch -> (ch = (lowercase_ascii ch)))
++  s) then str
+   else Printf.sprintf "|%s|" str;;
+ 
+-let read_sexpr string = raise X_not_yet_implemented ;;
++let char_prefix_nt = caten (char '#') (char '\\');;
++
++
++let ntf = pack (word_ci "#f") (fun b-> Bool(false));;
++let ntt = pack (word_ci "#t") (fun b-> Bool(true));;
++let bool_nt = disj ntf ntt;;
++
++let newline_nt = pack (word_ci "newline")(fun str -> Char(Char.chr(10)));;
++let tab_nt = pack (word_ci "tab") (fun str -> Char(Char.chr(9)));;
++let nul_nt = pack (word_ci "nul") (fun str -> Char(Char.chr(0)));;
++let space_nt = pack (word_ci "space") (fun str -> Char(Char.chr(32)));;
++let page_nt = pack (word_ci "page") (fun str -> Char(Char.chr(12)));;
++let return_nt = pack (word_ci "return") (fun str -> Char(Char.chr(13)));;
++let named_char = disj_list [newline_nt; tab_nt; nul_nt; space_nt; page_nt; return_nt];;
++
++let sp_nt = disj_list[char '\n' ; char ' ' ; char '\t'; const (fun ch -> ch < ' ')];;
++
++let vis_simp_ch = pack (const (fun ch -> ch > ' ')) (fun e -> Char(e));;
++
++let vis_named = fun s ->
++  try (diff vis_simp_ch named_char s)
++  with X_no_match -> named_char s;;
++
++let digit_nt = pack (range '0' '9') (fun st -> char_of_int(int_of_char(st)-48));;
++
++let af_nt = pack (range_ci 'a' 'f')
++  (fun st -> if (st >= 'A' && st <='F')
++    then char_of_int(int_of_char(st)-55)
++    else char_of_int(int_of_char(st)-87));;
++
++let hex_prefix_nt = word_ci "#x";;
++
++let hex_digit = disj digit_nt af_nt;;
++
++let hex_char = pack (caten (char_ci 'x') (caten hex_digit (maybe hex_digit)))
++  (fun (e, es) ->
++    let (e , es) =  es in
++    (match es with
++      Some(res) ->  Char(char_of_int(int_of_char(e)*16 + int_of_char(res)))
++    |None -> Char(e)));;
++
++let hex_not = fun s->
++  try(diff vis_named hex_char s)
++  with X_no_match -> hex_char s;;
++
++let char_nt = pack (caten char_prefix_nt hex_not) (fun (e1,e2) -> e2) ;;
++
++
++let minus_nt = const (fun ch -> ch = '-');;
++let plus_nt = const (fun ch -> ch = '+');;
++let miop_nt = disj minus_nt plus_nt;;
++
++let natural_nt = plus (range '0' '9');;
++let _num =
++  let _digits = plus (range '0' '9') in
++  pack _digits (fun (ds) -> (int_of_string (list_to_string ds)));;
++
++let integer_nt = pack (caten (maybe miop_nt) _num)
++  (fun (e, es)-> (match e with Some(res) -> (if (res ='-') then (Number(Int(0 - es))) else Number(Int(es)))
++     |_ -> Number(Int(es))));;
++let hex_natural = plus (disj (range '0' '9')  (range_ci 'a' 'f'));;
++
++let list_to_hex = fun s -> Scanf.sscanf (list_to_string(s)) "%x" (fun l -> l);;
++
++let hex_integer = pack (caten hex_prefix_nt (caten (maybe miop_nt) hex_natural))
++  (fun (z, (e, es)) ->
++    match e with
++      Some(res) -> (if (res = '-') then (Number(Int(0 - list_to_hex(es)))) else (Number(Int(list_to_hex(es)))))
++    |_ -> (Number(Int(list_to_hex(es)))));;
++
++let float_nt = pack (caten (maybe miop_nt)
++           (caten (plus (range '0' '9')) (caten (char '.') natural_nt)))
++  (fun (pm, (natural, (dot, frac)))->
++  let list = list_to_string(natural @ (dot :: frac)) in
++  let x = float_of_string(list) in
++  (match pm with
++    Some('-') -> Number(Float(0.0-.x))
++  |_-> (Number(Float(x)))));;
++
++let hex_float = pack (caten (word_ci "#x")
++      (caten (maybe miop_nt) (caten hex_natural (caten (char '.') hex_natural))))
++      (fun (x, (pm, (hn1, (dot, hn2)))) ->
++        let fl = "0x"^(list_to_string(hn1))^"."^list_to_string(hn2) in
++        (match pm with
++          Some('-') -> Number(Float(0.0 -. float_of_string(fl)))
++        |_ -> Number(Float(float_of_string(fl)))));;
++
++let scientific_notation =
++  let sign = (maybe miop_nt) in
++  let num = plus (range '0' '9') in
++  let dot =  (maybe (caten (char '.') num)) in
++  pack (caten sign (caten num (caten dot (caten (char_ci 'e') (caten sign num)))))
++    (fun (e1, (e2, (e3, (e4, (e5, e6))))) ->
++    let string1 = (match e1 with
++      |Some('-')-> "-" ^ list_to_string (e2)
++      |_-> list_to_string (e2)) in
++    let string2 = (match e3 with
++      |Some(res)-> (match res with
++	|(es1, es2)-> "." ^ list_to_string(es2))
++      |None -> "") in
++    let string2= (string2 ^ "e") in
++    let string3 = (match e5 with
++      |Some('-')-> "-" ^ list_to_string (e6)
++      |_-> list_to_string (e6)) in
++    (Number(Float(float_of_string ("" ^  string1 ^ string2 ^ string3))))) ;;
++
++let number_nt = disj_list[scientific_notation ; float_nt ; integer_nt ; hex_float ; hex_integer];;
++
++let str_lit_nt = const (fun ch -> ch != '\\' && ch != '\"');;
+ 
+-let read_sexprs string = raise X_not_yet_implemented;;
++let string_meta_nt =
++  pack (caten (char '\\') (disj_list [char '\\'; char '\"'; char 't'; char 'n'; char 'r'; char 'f']))
++    (fun (e, es)-> match es with
++    |'t' -> Char.chr(9)
++    |'\\' -> es
++    |'\"' -> es
++    |'n' -> '\n'
++    |'f' -> Char.chr(12)
++    |'r' -> '\r'
++    |_ -> raise X_no_match);;
++
++let string_hex_ch = pack (caten (char '\\') hex_char) (fun (e, es) -> es);;
++
++let string_ch s=
++  let result = (pack (caten (word_ci "\\x") (caten (caten hex_digit (maybe hex_digit)) (char ';')))
++    (fun(e1, (e2, e3)) ->
++      let (e, es) = e2 in
++       (match es with
++      Some(res) -> char_of_int(int_of_char(e)*16 + int_of_char(res))
++       |None -> e))) in
++  let dif1 = fun s ->
++    try (diff str_lit_nt string_meta_nt s)
++    with X_no_match ->
++      try(diff string_meta_nt result s)
++      with X_no_match -> result s
++  in dif1 s;;
++
++let string_nt = pack (caten (char '\"') (caten (star string_ch) (char '\"'))) (fun (e1, (e2, e3))-> String(list_to_string(e2)));; 
++
++let caps_sym =
++  let del = int_of_char 'A' - int_of_char 'a' in
++  pack (range 'A' 'Z') (fun ch -> char_of_int(int_of_char(ch) - del));;
++
++let sym_ch = disj_list [range '0' '9' ; caps_sym ; range 'a' 'z' ; char '!' ; char '$' ; char '^' ; char '*' ; char '-' ; char '_' ; char '=' ; char '+' ; char '<' ; char '>' ; char '?' ; char '/' ; char ':'];;
++
++let symbol s = pack (plus sym_ch) (fun l-> Symbol(list_to_string(l))) s;;
++
++let sym_num s = try (not_followed_by number_nt symbol s)
++  with X_no_match -> (symbol s);;		      
++  let endi = function
++    |[]-> ('\n', [])
++    |_ -> raise X_no_match;;
++let line_comment s =
++
++  pack (caten (char ';') (caten (star (const (fun ch -> ch != '\n'))) (disj (star(char '\n')) (disj (word "\\n") nt_end_of_input)))) (fun (e1, (e2, e3)) -> e1) s;;
++
++let rec _sexp s =  
++  pack (caten (star (disj_list [sexp_comment ; sp_nt ; line_comment])) (caten (disj_list
++				    [sym_num ; bool_nt ; char_nt ; string_nt ; nil_nt ; list_nt ; vector_nt ; quoted_nt ; quasi_quote; unquoted_nt ; unquote_spliced ; balance_par ; dotted_list]) (star (disj_list [sexp_comment ; sp_nt ; line_comment]))))(fun (e1, (e2, e3)) -> e2) s
++
++    and help ch str s = pack (caten (char ch) _sexp)(fun (e, es)-> Pair(Symbol(str), Pair(es, Nil))) s
++    and make_pair lst =
++    match lst with
++    |(e :: es) -> Pair(e, make_pair es) 
++    |[] -> Nil
++
++and nil_nt s =
++  let struc ch1 ch2 = caten (char ch1) (caten (star (disj_list [sexp_comment ; sp_nt ; line_comment])) (char ch2)) in
++  pack (disj (struc '(' ')') (struc '[' ']')) (fun (_ , (_, _)) -> Nil) s
++
++and list_diff s = (diff list_nt list_thd) s
++and list_nt s =
++  let struc ch1 ch2 nt = caten (char ch1) (caten (star nt) (char ch2)) in
++    (pack (disj (struc '(' ')' _sexp) (struc '[' ']' _sexp)) (fun (e1, (e2, e3))-> make_pair e2)) s
++
++and list_thd s =
++  let struc ch1 ch2 nt = caten (char ch1) (caten (star nt) (maybe (char ch2))) in
++    (pack (disj (struc '(' ')' balance_A) (struc '[' ']' balance_A)) (fun (e1, (e2, e3))-> make_pair e2)) s
++
++and dotted_list_diff s = (diff dotted_list dotted_list_thd) s
++and dotted_list s =
++  let struc ch1 ch2 dot nt = caten (char ch1) (caten (plus nt) (caten (char dot) (caten nt (char ch2)))) in
++    pack (disj (struc '(' ')' '.' _sexp) (struc '[' ']' '.' _sexp))
++      (fun (e1, (e2, (e3, (e4, e5)))) ->
++	List.fold_right (fun e1 e2 -> Pair(e1, e2)) e2 e4) s
++      
++and dotted_list_thd s =
++  let struc ch1 ch2 dot nt = caten (char ch1) (caten (plus nt) (caten (char dot) (caten nt (maybe (char ch2))))) in
++  pack (disj (struc '(' ')' '.' balance_A) (struc '[' ']' '.' balance_A))
++    (fun (e1, (e2, (e3, (e4, e5)))) ->
++      List.fold_right (fun e1 e2 -> Pair(e1, e2)) e2 e4) s
++
++and vector_diff s = (diff vector_nt vector_thd) s
++  and vector_nt s = pack (caten (char '#') (caten (char '(') (caten (star  (disj_list [sexp_comment ; sp_nt ; line_comment])) (caten (star _sexp) (char ')')))))
++  (fun (e1, (e2, (e3, (e4, e5))))-> Vector (e4)) s
++
++  and vector_thd s = pack (caten (char '#') (caten (char '(') (caten (star balance_A) (maybe (char ')')))))
++    (fun (e1, (e2, (e3, e4)))-> Vector (e3)) s 
++    
++  and quoted_nt s = (help '\'' "quote") s
++ 
++  and quasi_quote s = (help '`' "quasiquote") s
++
++  and unquoted_nt s = (help ',' "unquote") s
++
++  and unquote_spliced s = pack (caten (word ",@") _sexp)
++  (fun (e, es) -> Pair(Symbol("unquote-splicing"), Pair(es, Nil))) s
++
++  and sexp_comment s = (pack (caten (word "#;") _sexp) (fun (e1,e2)-> '\n')) s
++
++  and balance_A s =
++  let func = (diff _sexp balance_par) in
++	 pack (caten (star (disj_list [sexp_comment ; sp_nt ; line_comment])) (caten (disj_list [func ; vector_thd ; dotted_list_thd ; list_thd]) (star (disj_list [sexp_comment ; sp_nt ; line_comment])))) (fun (e1, (e2, e3))-> e2) s
++
++  and balance_par s = pack (caten (disj_list [dotted_list_thd ; list_thd ; vector_thd]) (caten (star (disj_list [sexp_comment ; sp_nt ; line_comment])) (word "..."))) (fun (e1, (e2, e3))-> e1) s;;
++
++
++let read_sexpr string =
++  let x = (_sexp (string_to_list string)) in
++  let (e, es) = x in
++  match es with
++  | [] -> e
++  | _ -> raise X_no_match;;
++
++let read_sexprs string =
++  let x = ((star _sexp) (string_to_list string)) in
++  let (e, es) = x in
++  e;;
+   
+ end;; (* struct Reader *)
++
++
+diff --git a/readme.txt b/readme.txt
+index e69de29..6a8b8d8 100644
+--- a/readme.txt
++++ b/readme.txt
+@@ -0,0 +1,12 @@
++itay shklar 308237411
++inbar naus 312231665
++
++I (We) assert that the work we submitted is 100% our own. We have not received any
++part from any other student in the class, nor have we give parts of it for use to others.
++Nor have we used code from other sources: Courses taught previously at this university,
++courses taught at other universities, various bits of code found on the internet, etc.
++We realize that should our code be found to contain code from other sources, that a
++formal case shall be opened against us with
++va’adat mishma’at
++, in pursuit of disciplinary
++action.
+diff --git a/semantic-analyser.ml b/semantic-analyser.ml
+index dbd1601..f78be11 100644
+--- a/semantic-analyser.ml
++++ b/semantic-analyser.ml
+@@ -5,7 +5,9 @@
+  *)
+ 
+ #use "tag-parser.ml";;
+-
++open Tag_Parser;;
++open Reader;;
++open PC;;
+ type var = 
+   | VarFree of string
+   | VarParam of string * int
+@@ -43,16 +45,25 @@ let rec expr'_eq e1 e2 =
+   | Def'(var1, val1), Def'(var2, val2)) -> (expr'_eq var1 var2) &&
+                                              (expr'_eq val1 val2)
+   | LambdaSimple'(vars1, body1), LambdaSimple'(vars2, body2) ->
++  	(List.length vars1 = List.length vars2) &&
+      (List.for_all2 String.equal vars1 vars2) &&
+        (expr'_eq body1 body2)
+   | LambdaOpt'(vars1, var1, body1), LambdaOpt'(vars2, var2, body2) ->
++     (List.length vars1 = List.length vars2) &&
+      (String.equal var1 var2) &&
+        (List.for_all2 String.equal vars1 vars2) &&
+          (expr'_eq body1 body2)
+-  | Applic'(e1, args1), Applic'(e2, args2)
++  | Applic'(e1, args1), Applic'(e2, args2) ->
++	 ((List.length args1 = List.length args2) &&
++	 (expr'_eq e1 e2) &&
++	   (List.for_all2 expr'_eq args1 args2))
+   | ApplicTP'(e1, args1), ApplicTP'(e2, args2) ->
++	 ((List.length args1 = List.length args2) &&
+ 	 (expr'_eq e1 e2) &&
+-	   (List.for_all2 expr'_eq args1 args2)
++	   (List.for_all2 expr'_eq args1 args2))
++  | BoxGet'(v1), BoxGet'(v2) -> expr'_eq (Var'(v1)) (Var'(v2))
++  | BoxSet'(v1, e1), BoxSet'(v2, e2) -> (expr'_eq (Var'(v1)) (Var'(v2))) && (expr'_eq e1 e2)
++  | Box'(v1), Box'(v2) -> expr'_eq (Var'(v1)) (Var'(v2))
+   | _ -> false;;
+ 	
+                        
+@@ -67,11 +78,264 @@ end;;
+ 
+ module Semantics : SEMANTICS = struct
+ 
+-let annotate_lexical_addresses e = raise X_not_yet_implemented;;
++let rec lexs e vars env= 
++ let help x = lexs x vars env in
++	(match e with
++	  | Const(constant) -> Const' (constant)
++	  | Var(str) -> varlex str vars env
++	  | If(e1, e2, e3) -> If'(lexs e1 vars env,
++	  							lexs e2 vars env,
++	  							lexs e3 vars env)
++	  | Seq(lst) -> Seq'(List.map (fun(x) -> (help x)) lst)
++	  | Set(e1, e2) -> Set'(help e1, help e2)
++	  | Def(e1, e2) -> Def'(help e1, help e2)
++	  | Or(lst) -> Or'(List.map (fun (x) -> help x) lst)
++	  | LambdaSimple (lst, e) -> LambdaSimple'(lst, lexs e lst (vars :: env))
++	  | LambdaOpt (strlst , str, expr) -> LambdaOpt'(strlst, str, lexs expr (List.append strlst [str]) (vars :: env))
++	  | Applic (exp1, explst) -> Applic' (lexs exp1 vars env, (List.map (fun (x) -> help x) explst)))
++
++and varlex str vars env =
++	let rec findIndex str lst =
++		(match lst with
++		| [] -> raise X_syntax_error
++		| h :: t -> if str = h then 0 else 1 + findIndex str t) in
++		let rec findBound str env depth=
++			(match env with
++			| [] -> raise X_syntax_error
++			| h :: t ->
++				try
++					let index = (findIndex str h) in
++					Var'(VarBound(str, depth, index))
++				with X_syntax_error -> findBound str t (depth + 1)) in
++		try
++			let index = (findIndex str vars) in
++			Var'(VarParam(str, index))
++		with X_syntax_error ->
++			try
++				findBound str env 0
++			with X_syntax_error -> Var'(VarFree(str));;
++
++let annotate_lexical_addresses e = lexs e [] [[]];;
++
++let rec tails e intp=
++	match e with
++	|Const'(exp') -> e
++	|Var'(str) -> e
++	|Or'(lst) -> Or'(checkOr lst intp)
++	|If'(test, dit, dif) -> If'((tails test false), (tails dit intp), (tails dif intp))
++	|Def'(e1, e2) -> Def' ((tails e1 false), (tails e2 false))
++	|LambdaSimple'(lst, exp) -> LambdaSimple'(lst, (tails exp true))
++	|LambdaOpt'(lst, opt, exp) -> LambdaOpt'(lst, opt, tails exp true)
++	|Applic'(op, lst) -> if (intp) then ApplicTP'((tails op false), (List.map (fun (x) -> tails x false) lst)) else Applic'((tails op false), (List.map (fun (x) -> tails x false) lst))
++	|Seq'(lst) -> Seq'(checkOr lst intp)
++	|Set'(exp1, exp2) -> Set'((tails exp1 false), (tails exp2 false))
++	|BoxSet'(exp1, exp2) -> BoxSet'(exp1, (tails exp2 false))
++	|_ -> e
++
++and checkOr lst intp =
++	match lst with
++	|h :: [] -> [tails h intp]
++	|h :: t -> (tails h false) :: (checkOr t intp)
++	|[] -> raise X_syntax_error;;
++
++let annotate_tail_calls e = tails e false;;
++
++let rec boxit e =
++	match e with
++	|Or'(lst) -> Or'(List.map boxit lst)
++	|If'(test, dit, dif) -> If'((boxit test), (boxit dit), (boxit dif))
++	|Def'(e1, e2) -> Def'((boxit e1), (boxit e2))
++	|Applic'(op, lst) -> Applic'((boxit op), List.map boxit lst)
++	|ApplicTP'(op, lst) -> ApplicTP'((boxit op), List.map (fun (x) -> boxit x) lst)
++	|Seq'(lst) -> Seq'(List.map (fun (x) -> boxit x) lst)
++	|Set'(e1, e2) -> Set'((boxit e1), (boxit e2))
++	|LambdaSimple'(lst, body) -> boxSimLam lst body
++	|LambdaOpt'(lst, opt, body) -> boxOptLam lst opt body
++	|BoxSet'(v, e) -> BoxSet'(v, boxit e)
++	|_ -> e
++
++and boxSimLam lst body =
++	let lamlist = List.map (fun (x) -> (x, lamsLst x body)) lst in (*list of lambdas in the body per param*)
++	let getsNsets = List.map (fun (par, lst) -> (*list of get lambas and set lambdas per param*)
++								 (par,
++								 	List.filter (fun (x) -> isGetter x par) lst,
++								 	List.filter (fun (x) -> isSetter x par) lst))
++							  lamlist in
++	let diffLams = List.filter (fun (par, gets, sets) -> (isntShared par gets sets body)) getsNsets in
++	(*is there a setter and a getter that arent sharing ancestor*)
++	let paramsToBox preds par = ormap (fun (p, _, _) -> String.equal p par) preds in
++	let paramsListToBox = List.map (fun (x) -> if (paramsToBox diffLams x) then x else "false") lst in
++	let boxBody = boxAll body paramsListToBox in
++	LambdaSimple'(lst, boxit boxBody)
++
++and boxOptLam lst opt body =
++	let lst1 = List.concat [lst; [opt]] in
++	let lamlist = List.map (fun (x) -> (x, lamsLst x body)) lst1 in
++	let getsNsets = List.map (fun (par, lst) ->
++								 (par,
++								 	List.filter (fun (x) -> isGetter x par) lst,
++								 	List.filter (fun (x) -> isSetter x par) lst))
++							  lamlist in
++	let diffLams = List.filter (fun (par, gets, sets) -> isntShared par gets sets body) getsNsets in
++	let paramsToBox preds par = ormap (fun (p, _, _) -> String.equal p par) preds in
++	let paramsListToBox = List.map (fun (x) -> if (paramsToBox diffLams x) then x else "false") lst1 in
++	let boxBody = boxAll body paramsListToBox in
++	LambdaOpt'(lst, opt, boxit boxBody)
++
++and boxAll body boxlst = 
++	let rec allFlase lst =
++		(match lst with
++		| [] -> true
++		| h :: t -> (String.equal h "false") && (allFlase t)) in
++	let rec addBox boxlst i =
++		(match boxlst with
++		|[] -> []
++		|h :: t -> if(String.equal h "false") then addBox t (i+1) else List.concat [[Set'(Var'(VarParam(h, i)), Box'(VarParam(h, i)))] ; addBox t (i+1)]) in
++	let rec replaceGets boxlist exp =
++		(match exp with
++		|Var'(VarBound(str, m1, m2)) -> if(ormap (String.equal str) boxlist) then BoxGet'(VarBound(str, m1, m2)) else exp
++		|Var'(VarParam(str, i)) -> if(ormap (String.equal str) boxlist) then BoxGet'(VarParam(str, i)) else exp
++		|Or'(lst) -> Or'(List.map (replaceGets boxlist) lst)
++		|If'(test, dit, dif) -> If'(replaceGets boxlist test, replaceGets boxlist dit, replaceGets boxlist dif)
++		|Def'(e1, e2) -> Def'(e1, replaceGets boxlist e2)
++		|LambdaSimple'(lst, body) -> (let filt = (List.map
++												 (fun (x) -> (if((String.equal x "false") || (ormap (fun (y) -> (String.equal x y)) lst)) then "false" else x))
++												  boxlist) in
++									(if ((allFlase filt) || (filt = [])) then exp else LambdaSimple'(lst, replaceGets filt body)))
++		|LambdaOpt'(lst, opt, body) -> (let filt = (List.map
++												(fun (x) -> (if((String.equal x "false") || (ormap (String.equal x)
++												 (List.concat [lst; [opt]]))) then "false" else x))
++												boxlist) in
++									(if ((allFlase filt) || filt = []) then exp else LambdaOpt'(lst, opt, replaceGets filt body)))
++		|Applic'(op, lst) -> Applic'(replaceGets boxlist op, List.map (replaceGets boxlist) lst)
++		|ApplicTP'(op, lst) -> ApplicTP'(replaceGets boxlist op, List.map (replaceGets boxlist) lst)
++		|Seq'(lst) -> Seq'(List.map (replaceGets boxlist) lst)
++		|Set'(Var'(v), exp2) -> (match v with
++								|VarParam(name, minor) -> if(ormap (String.equal name) boxlist) then BoxSet'(v, replaceGets boxlist exp2) else Set'(Var'(v), replaceGets boxlist exp2)
++								|VarBound(name, mjor, mnor) -> if (ormap (String.equal name) boxlist) then BoxSet'(v, replaceGets boxlist exp2) else Set'(Var'(v), replaceGets boxlist exp2)
++								|_ -> Set'(Var'(v), replaceGets boxlist exp2))
++		|Set'(e1, e2) -> Set'(replaceGets boxlist e1, replaceGets boxlist e2)
++		|BoxSet'(v, e) -> BoxSet'(v, replaceGets boxlist e)
++		|_ -> exp) in
++		let b = addBox boxlst 0 in
++		let mashu = replaceGets boxlst body in
++		if(List.length b = 0) then mashu else Seq'(List.concat [b; [mashu]])
++
++and lamsLst par exp =
++	match exp with
++	|Or'(lst) -> List.concat (List.map (fun (x) -> lamsLst par x) lst)
++	|If'(test, dit, dif) -> List.concat [(lamsLst par test); (lamsLst par dit); (lamsLst par dif)]
++	|Def'(_, e2) -> lamsLst par e2
++	|LambdaSimple'(lst, body) -> if(List.filter (fun (x) -> (String.equal x par)) lst = []) then [exp] else []
++	|LambdaOpt'(lst, opt, body) -> if(List.filter (fun (x) -> String.equal x par) (List.concat [lst; [opt]]) = []) then [exp] else []
++	|Applic'(op, lst) -> List.concat [lamsLst par op; List.concat (List.map (fun (x) -> lamsLst par x) lst)]
++	|ApplicTP'(op, lst) -> List.concat [lamsLst par op; List.concat (List.map (fun (x) -> lamsLst par x) lst)]
++	|Seq'(lst) -> List.concat (List.map (fun (x) -> lamsLst par x) lst)
++	|Set'(_, exp2) -> lamsLst par exp2
++	|BoxSet'(_, exp2) -> lamsLst par exp2
++	|_ -> []
++
++and isGetter exp par =
++	match exp with
++	|Var'(VarBound(str, _, _)) -> String.equal str par
++	|Var'(VarParam(str, _)) -> String.equal str par
++	|Or'(lst) -> ormap (fun (x) -> isGetter x par) lst
++	|If'(test, dit, dif) -> isGetter test par || isGetter dit par || isGetter dif par
++	|Def'(_, e2) -> isGetter e2 par
++	|LambdaSimple'(lst, body) -> if(List.length (List.filter (fun (x) -> String.equal x par) lst) = 0) then isGetter body par else false
++	|LambdaOpt'(lst, opt, body) -> if(List.filter (fun (x) -> String.equal x par) (List.concat [lst; [opt]]) = []) then isGetter body par else false
++	|Applic'(op, lst) -> isGetter op par || ormap (fun (x) -> isGetter x par) lst
++	|ApplicTP'(op, lst) -> isGetter op par || ormap (fun (x) -> isGetter x par) lst
++	|Seq'(lst) -> ormap (fun (x) -> isGetter x par) lst
++	|Set'(_, exp2) -> isGetter exp2 par
++	|BoxSet'(_, exp2) -> isGetter exp2 par
++	|BoxGet'(v) -> (match v with
++					|VarBound(str, _, _) -> String.equal par str
++					|VarParam(str, _) -> String.equal par str
++				|_-> false)
++	|_ -> false
++
++and isSetter exp par =
++	match exp with
++	|Or'(lst) -> ormap (fun (x) -> isSetter x par) lst
++	|If'(test, dit, dif) -> isSetter test par || isSetter dit par || isSetter dif par
++	|Def'(_, e2) -> isSetter e2 par
++	|LambdaSimple'(lst, body) -> if(List.filter (fun (x) -> String.equal x par) lst = []) then isSetter body par else false
++	|LambdaOpt'(lst, opt, body) -> if(List.filter (fun (x) -> String.equal x par) (List.concat [lst; [opt]]) = []) then (isSetter body par) else false
++	|Applic'(op, lst)-> isSetter op par || ormap (fun (x) -> isSetter x par) lst
++	|ApplicTP'(op, lst)-> isSetter op par || ormap (fun (x) -> isSetter x par) lst
++	|Seq'(lst) -> ormap (fun (x) -> isSetter x par) lst
++	|Set'(Var'(VarBound(str, _, _)), exp2) -> String.equal str par || isSetter exp2 par
++	|Set'(Var'(VarParam(str, _)), exp2) -> String.equal str par || isSetter exp2 par
++	|BoxSet'(VarBound(str, _, _), exp2) -> String.equal str par || isSetter exp2 par
++	|BoxSet'(VarParam(str, _), exp2) -> String.equal str par || isSetter exp2 par
++	|_ -> false
++
++and isntShared par gets sets body =
++	let tmpget = isFirstdegreeGet par body in
++	let tmpset = isFirstdegreeSet par body in
++	let rec chk par get sets = 
++		(match sets with
++		|[] -> false
++		|set :: t -> (if(expr'_eq get set) then ((chkMoreOne get par body) || (chk par get t)) else true)) in
++	let rec recur par gets sets body =
++		match gets with
++		|[] -> false
++		|h :: t -> (chk par h sets) || (recur par t sets body) in
++	match gets, sets with
++	|[], [] -> false
++	|[], _ -> tmpget
++	|_, [] -> tmpset
++	|_, _ -> tmpset || tmpget || recur par gets sets body 
++
++and chkMoreOne exp par body =
++	let rec chk exp lams index =
++		(match lams with
++		|[] -> false
++		|h :: t -> if (expr'_eq exp h) then (if(index) then true else chk exp t true) else chk exp t index) in
++	let lamlst = lamsLst par body in
++	chk exp lamlst false
++
++and isFirstdegreeGet par exp =
++	match exp with
++  | Var'(VarParam(str, _)) -> String.equal str par
++  | Var'(VarBound(str, _, _)) -> String.equal str par
++  | If' (test, dit, dif) -> isFirstdegreeGet par test || isFirstdegreeGet par dit || isFirstdegreeGet par dif
++  | Seq'(lst) -> ormap (isFirstdegreeGet par) lst
++  | Set'(_, e2) -> isFirstdegreeGet par e2
++  | Def'(_, e2) -> isFirstdegreeGet par e2
++  | Or'(lst) -> ormap (isFirstdegreeGet par) lst
++  | LambdaSimple'(_, _) -> false
++  | LambdaOpt' (_, _,_) -> false
++  | Applic'(e, lst) -> isFirstdegreeGet par e || ormap (isFirstdegreeGet par) lst
++  | ApplicTP' (e, lst) -> isFirstdegreeGet par e || ormap (isFirstdegreeGet par) lst
++  | BoxGet'(v) -> (match v with
++					|VarParam(str, _) -> String.equal par str
++					|_-> false)
++	|BoxSet'(_, e) -> isFirstdegreeGet par e
++  |_ -> false
+ 
+-let annotate_tail_calls e = raise X_not_yet_implemented;;
++and isFirstdegreeSet par exp =
++	match exp with
++  | If' (test, dit, dif) -> isFirstdegreeSet par test || isFirstdegreeSet par dit || isFirstdegreeSet par dif
++  | Seq'(lst) -> ormap (isFirstdegreeSet par) lst
++  | Set'(e1, e2) -> (let tmp = (match e1 with
++  					|Var'(VarParam(name, _)) -> String.equal name par
++  					|_ -> isFirstdegreeSet par e1) in
++  						tmp || isFirstdegreeSet par e2)
++  | Def'(_, e2) -> isFirstdegreeSet par e2
++  | Or'(lst) -> ormap (isFirstdegreeSet par) lst
++  | LambdaSimple'(_, _) -> false
++  | LambdaOpt' (_, _,_) -> false
++  | Applic'(e, lst) -> isFirstdegreeSet par e || ormap (isFirstdegreeSet par) lst
++  | ApplicTP' (e, lst) -> isFirstdegreeSet par e || ormap (isFirstdegreeSet par) lst
++  | BoxSet'(v, e) -> (match v with
++  					|VarBound(str, _, _) -> String.equal par str || isFirstdegreeSet par e
++					|VarParam(str, _) -> String.equal par str || isFirstdegreeSet par e
++				|_-> false)
++  |_ -> false;;
+ 
+-let box_set e = raise X_not_yet_implemented;;
++let box_set e = boxit e;;
+ 
+ let run_semantics expr =
+   box_set
+diff --git a/tag-parser.ml b/tag-parser.ml
+index 619497a..67ed635 100644
+--- a/tag-parser.ml
++++ b/tag-parser.ml
+@@ -5,6 +5,7 @@
+  *)
+ 
+ #use "reader.ml";;
++open Reader;;
+ 
+ type constant =
+   | Sexpr of sexpr
+@@ -47,16 +48,28 @@ let rec expr_eq e1 e2 =
+        (List.for_all2 expr_eq args1 args2)
+   | _ -> false;;
+ 	
+-                       
++
++
+ exception X_syntax_error;;
+ 
+ module type TAG_PARSER = sig
+   val tag_parse_expression : sexpr -> expr
+   val tag_parse_expressions : sexpr list -> expr list
+-end;; (* signature TAG_PARSER *)
++end (* signature TAG_PARSER *)
+ 
+ module Tag_Parser : TAG_PARSER = struct
+ 
++let rec pairs_list s =
++	match s with
++	|Nil -> []
++	|Pair(e, es) -> e :: (pairs_list es)
++	|_ -> raise X_syntax_error;;
++
++let rec list_pairs s = 
++	match s with
++	|e :: es -> Pair(e, list_pairs es)
++	|[] -> Nil;;
++
+ let reserved_word_list =
+   ["and"; "begin"; "cond"; "define"; "else";
+    "if"; "lambda"; "let"; "let*"; "letrec"; "or";
+@@ -65,9 +78,297 @@ let reserved_word_list =
+ 
+ (* work on the tag parser starts here *)
+ 
+-let tag_parse_expression sexpr = raise X_not_yet_implemented;;
++let condi e1 e2 x = 
++	let tmp = (match x with |Nil -> x |_ -> Pair(Pair(Symbol("rest"), Pair(Pair(Symbol("lambda"), Pair(Nil, Pair(x, Nil))), Nil)), Nil)) in
++	Pair(Symbol("let"), 
++		Pair(
++			Pair(
++				Pair(
++					Symbol("value"), 
++					Pair(e1, Nil)
++				), 
++				Pair(
++					Pair(
++						Symbol("f"),
++						Pair(
++							Pair(
++								Symbol("lambda"),
++								Pair(
++									Nil, 
++									e2
++								)
++							),
++							Nil)),
++					tmp
++				)
++			),
++			Pair(
++				Pair(
++					Symbol("if"),
++					Pair(
++						Symbol("value"),
++						Pair(
++							Pair(
++								Pair(
++									Symbol("f"),
++									Nil
++								),
++								Pair(
++									Symbol("value"),
++									Nil
++								)
++							), (match x with |Nil -> x |_-> Pair(Pair(Symbol("rest"), Nil), Nil))
++						)
++					)
++				),Nil
++			)
++		)
++	);;
++
++let rec sexprs_strings s =
++  match s with
++  |Pair(e, es)->
++     (match e with
++     |Symbol(d) -> d :: (sexprs_strings es)
++     |_-> raise X_syntax_error)
++  |_-> [];;
++
++let rec isIn list value =
++    (fun l v -> match l with
++    |e :: es -> e = v || isIn es v
++    |[] -> false) list value;;
++
++let isVar = fun x ->
++  if(isIn reserved_word_list x) then false else true;;
++
++let rec uniq_list lst =
++  match lst with
++  |(e :: es) -> if(isIn es e) then false else uniq_list es
++  |[] -> true;;
++
++
++let rec make_whatever names =
++	(match names with
++	|[] -> Nil
++	|e :: es -> Pair(Pair(e, Pair(Pair(Symbol("quote"), Pair(Symbol("whatever"), Nil)), Nil)), (make_whatever es)));;
++
++let rec make_sets pars body =
++	(match pars with
++	|Nil -> body
++	|Pair(e, es) -> Pair(Pair(Symbol("set!"), e), (make_sets es body))
++	|_ -> raise X_syntax_error);;
++
++let rec tag_parse s = 
++  match s with
++    |Number (d) -> Const(Sexpr(Number(d)))
++    |Char(d) -> Const(Sexpr(Char(d)))
++    |String(d) -> Const(Sexpr(String(d)))
++    |Bool(d) -> Const(Sexpr(Bool(d)))
++    |Symbol(d) -> (if (isVar d) then Var(d) else raise X_syntax_error)
++    |_ -> tag_sym(s)
++
++and tag_list s =
++  match s with
++  |Pair(e, Nil) -> (tag_parse e) :: [] 
++  |Pair(e, es) -> tag_parse e :: tag_list es
++  |Nil ->[]
++  |_ -> raise X_syntax_error
++
++and tag_prop_list s =
++  match s with
++  |Pair(e, Nil) -> (tag_parse e) :: [] 
++  |Pair(e, es) -> tag_parse e :: tag_prop_list es
++  |Nil ->[]
++  |_ -> raise X_syntax_error
++
++and tag_seq s =
++  (match s with
++  |Pair(e, es) -> (match e with
++    |Pair(_, _) -> Seq(tag_list s)
++    |_ -> tag_parse s)
++  |_ -> tag_parse s)
++     
++and tag_sym s =
++  (match s with
++  |Pair(Symbol("if"), Pair(test, Pair(dit, Pair(dif, Nil)))) -> If(tag_parse test, tag_parse dit, tag_parse dif)
++  |Pair(Symbol("if"), Pair(test, Pair(dit, Nil))) -> If(tag_parse test, tag_parse dit, Const(Void))
++  |Pair(Symbol("quote"), Pair(d, Nil)) -> Const(Sexpr(d))
++  |Pair(Symbol("lambda"), es) -> tag_lambda es
++  |Pair(Symbol("or"), Nil) -> Const(Sexpr(Bool(false)))
++  |Pair(Symbol("or"), Pair(es, Nil)) -> tag_parse es
++  |Pair(Symbol("or"), es) -> expand_or es
++  |Pair(Symbol("define"), es) -> expand_define es
++  |Pair(Symbol("set!"), Pair(sexp1, Pair(sexp2, Nil))) -> 
++  			let tmp1 = (match sexp1 with  				
++  			|Symbol(_) -> tag_parse sexp1
++  			|_-> raise X_syntax_error) in
++  			let tmp2 = (match sexp2 with
++  				|String(d1) -> (if (isVar d1) then tag_parse sexp2 else raise X_syntax_error)
++  				
++  			|_ -> tag_parse sexp2) in
++  			Set(tmp1, tmp2)
++  |Pair(Symbol("begin"), Nil) -> Const(Void)
++  |Pair(Symbol("begin"), Pair(exp, Nil)) -> tag_parse exp
++  |Pair(Symbol("begin"), es) -> (match es with |Pair(x, y) -> Seq(tag_list es) |Nil -> Seq([]) |_-> raise X_syntax_error)
++  |Pair(Symbol("quasiquote"), Pair(Pair(Symbol "unquote-splicing", _), Nil)) -> raise X_syntax_error
++  |Pair(Symbol("quasiquote"), Pair(es, Nil)) -> tag_parse(expand_quasi es)
++  |Pair(Symbol("cond"), es) -> tag_parse(expand_cond es)
++  |Pair(Symbol("let"), Pair(params, body)) -> tag_parse (expand_let params body)
++  |Pair(Symbol("let*"), es) -> tag_parse (expand_let_star es)
++  |Pair(Symbol("letrec"), es) -> tag_parse(expand_letrec es)
++  |Pair(Symbol("and"), Nil) -> Const(Sexpr(Bool true))
++  |Pair(Symbol("and"), es) -> tag_parse(expand_and es)
++  |Pair(x, y) -> Applic(tag_parse x, tag_prop_list y)
++  |_ -> raise X_syntax_error)
++
++ and expand_define s = 
++ 	(match s with
++ 	|Nil -> raise X_syntax_error
++ 	|Pair(Pair(e, e1), e2) -> let x = Pair(Symbol("define"), Pair(e, Pair(Pair(Symbol("lambda"), Pair(e1, e2)), Nil))) in
++ 											tag_parse x 
++ 	|Pair(e, Pair(es, Nil)) -> let x= tag_parse e in
++ 								(match x with
++ 								| Var(y) -> Def(x, tag_parse es)
++ 								| _ -> raise X_syntax_error)
++ 	|_ -> raise X_syntax_error)
++
++and expand_or s = 
++	let lst = List.map(fun x -> tag_parse x)(pairs_list s) in
++	(match lst with
++		|[] -> raise X_syntax_error
++		| e::es -> (match lst with
++			| [] -> e
++			| _ -> Or(lst)))
++
++and expand_and s = 
++	(match s with
++	|Pair(e, Nil) -> e
++	|Pair(e, es) -> Pair(Symbol("if"), Pair(e, Pair(Pair(Symbol("and"), es), Pair(Bool false, Nil))))
++	|_ -> raise X_syntax_error)
++
++and expand_letrec s =
++	(match s with
++		|Pair(Nil, body)-> Pair(Symbol("let"), s)
++		|Pair(params, body) -> 
++			let pars = List.map 
++				(fun x -> match x with |Pair(name, Pair(sexp, Nil))-> (name, sexp) |_-> raise X_syntax_error)
++				(pairs_list params) in
++			let names = List.map
++					(fun (name, sexp) -> name)
++					pars in
++					let whats = make_whatever names in
++						let ass = make_sets params body in
++							Pair(Symbol("let"), Pair(whats , ass))
++		|_-> raise X_syntax_error)
++
++and expand_let_star s =
++	(match s with
++	|Pair(Nil, es) -> expand_let Nil es
++	|Pair(params, body) -> (match params with
++							|Pair(_, Nil) -> (expand_let params body)
++							|Pair(e, es) -> (Pair(Symbol("let"), Pair(Pair(e, Nil), Pair(Pair(Symbol("let*"), Pair(es, body)), Nil))))
++							|_-> raise X_syntax_error)
++	|_-> raise X_syntax_error)
++
++and expand_let params body =
++	let pars = List.map 
++				(fun x -> match x with |Pair(name, Pair(sexp, Nil))-> (name, sexp) |_-> raise X_syntax_error)
++				(pairs_list params) in
++		let names = List.map
++					(fun (name, sexp) -> name)
++					pars in
++			let sexps = List.map
++						(fun (name, sexp) -> sexp)
++						pars in
++				Pair(
++					Pair(Symbol("lambda"), 
++						Pair(
++							(list_pairs names), 
++							body)),
++					(list_pairs sexps))
++
++and expand_quasi s =
++	(match s with
++		|Pair(Symbol("unquote"), Pair(exp, Nil)) -> exp
++		|Symbol(_) -> Pair(Symbol("quote"), Pair(s, Nil))
++		|Nil -> Pair(Symbol("quote"), Pair(s, Nil))
++		|Vector(es) -> Pair(Symbol("vector"), list_pairs(List.map expand_quasi es))
++		|Pair(e1, e2) ->
++			(match e1 with
++			|Pair(Symbol("unquote-splicing"), Pair(a, Nil)) -> Pair(Symbol("append"), Pair(a, Pair(expand_quasi e2, Nil)))
++			|_ ->
++				(match e2 with
++					|Pair(Symbol("unquote-splicing"), b) -> Pair(Symbol("cons"), Pair((expand_quasi e1), b))
++					|_ -> Pair(Symbol("cons"), Pair(expand_quasi e1, Pair(expand_quasi e2, Nil)))))
++		|_ -> s)
++
++and expand_cond s =
++	(match s with
++	|Pair(e1, e2) -> expand_rib e1 e2
++	|Nil -> Nil
++	|_ -> raise X_syntax_error)
++
++and expand_rib s1 s2 =
++	(match s1 with
++	|Pair(Symbol("else"), es) -> Pair(Symbol("begin"), es)
++	|Pair(e1, Pair(Symbol("=>"), e2)) -> 
++		condi e1 e2 (expand_cond s2)
++	|Pair(e1, e2) -> Pair(Symbol("if"), Pair(e1, Pair(Pair(Symbol("begin"), e2), 
++													(match s2 with |Nil -> Nil |_ -> Pair((expand_cond s2), Nil)))))
++	|_-> raise X_syntax_error)
++
++
++     and check lst =
++	 (match lst with
++	 |Pair(x, y) ->
++	    (match x with
++	    |Symbol(d) ->
++	       let (e, es) = (match y with
++	       |Nil -> ([], None)
++	       |Pair(e1, e2) -> check y
++	       |Symbol(e1)-> ([], Some(e1))
++	       |_-> raise X_syntax_error) in
++	       	          (d :: e, es)
++	    |_ -> raise X_syntax_error)
++	 |Nil -> ([], None)
++	 |Symbol(e1)-> ([], Some(e1))
++	 |_-> raise X_syntax_error)
++	   
++
++
++     and tag_lambda s =
++       (match s with
++       |Pair(pars, Nil) -> raise X_syntax_error
++       |Pair(pars, body) ->
++	 (match body with
++	 |Pair(sexp, Nil) ->
++          let (e1, e2) = check pars in
++          let exp = tag_parse sexp in
++	  		if(uniq_list e1) then
++	          (match e2 with
++	          |None -> LambdaSimple(e1, exp)
++	          |Some(result) -> 
++				(if (isIn e1 result) then raise X_syntax_error else LambdaOpt(e1, result, exp)))
++	  else raise X_syntax_error
++	 |Pair(sexp, res) -> 
++	  let (e1, e2) = check pars in
++	  let res1 = Seq(tag_list body) in
++	  if(uniq_list e1) then
++          (match e2 with
++          |None -> LambdaSimple(e1, res1)
++          |Some(result) -> 
++		(if (isIn e1 result) then raise X_syntax_error else LambdaOpt(e1, result, res1)))
++	  else raise X_syntax_error
++	|_-> raise X_syntax_error)
++       |_ -> raise X_syntax_error);;
++
++
++
++
++   let tag_parse_expression sexpr = tag_parse sexpr;;
++   
++let tag_parse_expressions sexpr = List.map(tag_parse)(sexpr);;
++
+ 
+-let tag_parse_expressions sexpr = raise X_not_yet_implemented;;
+ 
+-  
+ end;; (* struct Tag_Parser *)
